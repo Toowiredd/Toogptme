@@ -1,22 +1,31 @@
-[tool.poetry]
+[project]
 name = "gptme"
-version = "0.22.0"
+version = "0.26.0"
 description = "Personal AI assistant in your terminal that can use the shell, run code, edit files, browse the web, and use vision. An unconstrained local alternative to ChatGPT's Code Interpreter."
-authors = ["Erik Bjäreholt <erik@bjareho.lt>"]
+authors = [
+    { name = "Erik Bjäreholt", email = "erik@bjareho.lt" },
+]
 readme = "README.md"
 license = "MIT"
 packages = [
     { include = "gptme" },
 ]
-
 include = ["gptme/server/static/**/*", "media/logo.png"]
+dynamic = ["dependencies"]  # "version"
 
-[tool.poetry.scripts]
+[project.urls]
+Homepage = "https://gptme.org/"
+Repository = "https://github.com/ErikBjare/gptme"
+Documentation = "https://gptme.org/docs/"
+Issues = "https://github.com/ErikBjare/gptme/issues"
+
+[project.scripts]
 gptme = "gptme.cli:main"
 gptme-server = "gptme.server.cli:main"
 gptme-eval = "gptme.eval.main:main"
+gptme-util = "gptme.util.cli:main"
 gptme-nc = "gptme.ncurses:main"
-ncgptme = "gptme.ncurses:main"
+gptme-wut = "gptme.wut:main"
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -30,17 +39,18 @@ tomlkit = "*"
 typing-extensions = "*"
 platformdirs = "^4.3"
 lxml = "*"
+json-repair = "^0.32.0"
+
+# providers
+openai = "^1.0"
+anthropic = "^0.42"
 
 # tools
 ipython = "^8.17.2"
 bashlex = "^0.18"
-playwright = {version = "1.47.*", optional=true}  # version constrained due to annoying to have to run `playwright install` on every update
-youtube_transcript_api = {version = "^0.6.1", optional = true}
-python-xlib = {version = "^0.33", optional = true}  # for X11 interaction
-
-# providers
-openai = "^1.0"
-anthropic = "^0.36.0"
+playwright = {version = "1.49.1", optional=true}  # version constrained due to annoying to have to run `playwright install` on every update
+youtube_transcript_api = {version = "^0.6.1", optional=true}
+python-xlib = {version = "^0.33", optional=true}  # for X11 interaction
 
 # evals
 multiprocessing-logging = "^0.3.4"
@@ -49,16 +59,19 @@ multiprocessing-logging = "^0.3.4"
 matplotlib = {version = "*", optional=true}
 pandas = {version = "*", optional=true}
 numpy = {version = "*", optional=true}
+scipy = {version="*", optional=true}
 pillow = {version = "*", optional=true}
+sounddevice = {version="^0.5.1", optional=true}
 
 # server
 flask = {version = "^3.0", optional=true}
-flask-cors = {version = "^4.0", optional=true}
+flask-cors = {version = ">=4,<6", optional=true}
 
 [tool.poetry.group.dev.dependencies]
 # lint
 mypy = "*"
 ruff = "*"
+pylint = "*"
 pre-commit = "*"
 
 # test
@@ -69,14 +82,15 @@ pytest-profiling = "^1.7.0"
 pytest-dotenv = "^0.5.2"
 pytest-timeout = "^2.2.0"
 pytest-retry = "^1.6.3"
+pytest-mock = "*"
 greenlet = "*"  # dependency of playwright, but needed for coverage
 
 # docs
 sphinx = "^8.0"
 sphinx-click = "^6.0"
 sphinx-book-theme = "^1.0.1"
-sphinxcontrib-programoutput = "^0.17"
-sphinxcontrib-asciinema = "^0.4.2"
+sphinxcontrib-programoutput = "*"
+sphinxcontrib-asciinema = "*"
 myst-parser = "*"
 
 # types
@@ -87,16 +101,22 @@ types-lxml = "*"
 server = ["flask", "flask-cors"]
 browser = ["playwright"]
 datascience = ["matplotlib", "pandas", "numpy", "pillow"]
-computer = ["python-xlib", "pillow"]  # pillow already in datascience but listed for clarity
+computer = ["pillow"]
+youtube = ["youtube_transcript_api"]
+tts = ["sounddevice", "scipy", "numpy"]
 all = [
     # server
     "flask", "flask-cors",
     # browser
     "playwright",
     # datascience
-    "matplotlib", "pandas", "numpy", "pillow",
+    "matplotlib", "pandas", "numpy", "scipy", "pillow",
     # computer
-    "python-xlib",
+    "pillow",
+    # youtube transcript tool
+    "youtube_transcript_api",
+    # tts
+    "sounddevice", "scipy", "numpy",
 ]
 
 [tool.ruff]
@@ -110,6 +130,30 @@ select = ["E4", "E7", "E9", "F", "B", "UP"]
 ignore = ["E402", "E501", "B905"]
 #fixable = ["ALL"]
 #unfixable = ["B"]
+
+[tool.mypy]
+check_untyped_defs = true
+disable_error_code = "import-untyped"
+
+[[tool.mypy.overrides]]
+module = "langchain.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "scipy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sounddevice.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "flask.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [
@@ -140,15 +184,6 @@ exclude_also = [
     "if TYPE_CHECKING:",
 ]
 
-
-# TODO: migrate to PEP 621 once supported by poetry
-#[project]
-#name = "gptme"
-#dynamic = ["version"]
-#
-#[tool.setuptools.dynamic]
-#version = {attr = "mymodule.__version__"}
-
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0"]
 build-backend = "poetry.core.masonry.api"

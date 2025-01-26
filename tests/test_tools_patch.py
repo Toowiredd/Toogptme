@@ -1,4 +1,4 @@
-from gptme.tools.patch import Patch, apply
+from gptme.tools.patch import Patch, apply, execute_patch
 
 example_patch = """
 <<<<<<< ORIGINAL
@@ -7,6 +7,16 @@ original lines
 modified lines
 >>>>>>> UPDATED
 """
+
+
+def test_execute_patch(temp_file):
+    with temp_file("""original lines""") as f:
+        result = next(execute_patch(example_patch, [f], None)).content
+
+        assert "successfully" in result
+
+        with open(f, encoding="utf-8") as f:
+            assert f.read() == """modified lines"""
 
 
 def test_apply_simple():
@@ -44,7 +54,19 @@ def hello(name="world"):
     )
 
 
-def test_clear_file():
+def test_apply_clear_file():
+    content = "test"
+    codeblock = """
+<<<<<<< ORIGINAL
+test
+=======
+>>>>>>> UPDATED
+    """
+    result = apply(codeblock, content)
+    assert result == ""
+
+
+def test_apply_rm_function():
     # only remove code in patch
     content = """
 def hello():
@@ -54,22 +76,15 @@ if __name__ == "__main__":
     hello()
 """
 
-    # NOTE: test fails if UPDATED block doesn't have an empty line
     codeblock = """
 <<<<<<< ORIGINAL
 def hello():
     print("hello")
 =======
-
 >>>>>>> UPDATED
 """
-    print(content)
     result = apply(codeblock, content)
-    newline = "\n"
-    newline_escape = "\\n"
-    assert result.startswith(
-        "\n\n"
-    ), f"result: {result.replace(newline, newline_escape)}"
+    assert result.count("\n") == content.count("\n") - 1
 
 
 def test_apply_empty_lines():

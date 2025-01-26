@@ -6,18 +6,22 @@ Inspired by a document by Anton Osika and Axel Theorell.
 
 import csv
 import logging
+import os
 import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast, get_args
 
 import click
 import multiprocessing_logging
 from tabulate import tabulate
 
+from ..config import get_config
 from ..message import len_tokens
+from ..tools import ToolFormat
 from .run import run_evals
 from .suites import suites, tests_default, tests_map
 from .types import CaseResult, EvalResult, EvalSpec
@@ -49,7 +53,8 @@ def print_model_results(model_results: dict[str, list[EvalResult]]):
     for model, results in model_results.items():
         print(f"\nResults for model: {model}")
         model_total_tokens = sum(
-            len_tokens(result.gen_stdout) + len_tokens(result.run_stdout)
+            len_tokens(result.gen_stdout, "gpt-4")
+            + len_tokens(result.run_stdout, "gpt-4")
             for result in results
         )
         print(f"Completed {len(results)} tests in {model_total_tokens}tok:")
@@ -59,8 +64,8 @@ def print_model_results(model_results: dict[str, list[EvalResult]]):
             duration_result = (
                 result.timings["gen"] + result.timings["run"] + result.timings["eval"]
             )
-            gen_tokens = len_tokens(result.gen_stdout)
-            run_tokens = len_tokens(result.run_stdout)
+            gen_tokens = len_tokens(result.gen_stdout, "gpt-4")
+            run_tokens = len_tokens(result.run_stdout, "gpt-4")
             result_total_tokens = gen_tokens + run_tokens
             print(
                 f"{checkmark} {result.name}: {duration_result:.0f}s/{result_total_tokens}tok "
@@ -91,10 +96,14 @@ def print_model_results_table(model_results: dict[str, list[EvalResult]]):
             try:
                 result = next(r for r in results if r.name == test_name)
                 passed = all(case.passed for case in result.results)
-                checkmark = "✅" if result.status == "success" and passed else "❌"
+                checkmark = (
+                    "✅"
+                    if result.status == "success" and passed
+                    else ("🟡" if result.status == "timeout" else "❌")
+                )
                 duration = sum(result.timings.values())
-                gen_tokens = len_tokens(result.gen_stdout)
-                run_tokens = len_tokens(result.run_stdout)
+                gen_tokens = len_tokens(result.gen_stdout, "gpt-4")
+                run_tokens = len_tokens(result.run_stdout, "gpt-4")
                 reason = "timeout" if result.status == "timeout" else ""
                 if reason:
                     row.append(f"{checkmark} {reason}")
@@ -124,8 +133,8 @@ def aggregate_and_display_results(result_files: list[str]):
                     }
                 all_results[model][result.name]["total"] += 1
                 all_results[model][result.name]["tokens"] += len_tokens(
-                    result.gen_stdout
-                ) + len_tokens(result.run_stdout)
+                    result.gen_stdout, "gpt-4"
+                ) + len_tokens(result.run_stdout, "gpt-4")
                 if result.status == "success" and all(
                     case.passed for case in result.results
                 ):
@@ -178,15 +187,21 @@ def aggregate_and_display_results(result_files: list[str]):
     "--model",
     "-m",
     multiple=True,
-    help="Model to use, can be passed multiple times.",
+    help="Model to use, can be passed multiple times. Can include tool format with @, e.g. 'gpt-4@tool'",
 )
 @click.option("--timeout", "-t", default=30, help="Timeout for code generation")
 @click.option("--parallel", "-p", default=10, help="Number of parallel evals to run")
+@click.option(
+    "--tool-format",
+    type=click.Choice(get_args(ToolFormat)),
+    help="Tool format to use. Can also be specified per model with @format.",
+)
 def main(
     eval_names_or_result_files: list[str],
     _model: list[str],
     timeout: int,
     parallel: int,
+    tool_format: ToolFormat | None = None,
 ):
     """
     Run evals for gptme.
@@ -197,13 +212,59 @@ def main(
     # init
     multiprocessing_logging.install_mp_handler()
 
-    models = _model or [
-        "openai/gpt-4o",
-        "openai/gpt-4o-mini",
-        "anthropic/claude-3-5-sonnet-20241022",
-        "anthropic/claude-3-5-haiku-20241022",
-        "openrouter/meta-llama/llama-3.1-405b-instruct",
-    ]
+    config = get_config()
+
+    # Generate model+format combinations
+    default_models = []
+    if config.get_env("OPENAI_API_KEY"):
+        default_models.extend(
+            [
+                "openai/gpt-4o@tool",
+                "openai/gpt-4o@markdown",
+                "openai/gpt-4o@xml",
+                "openai/gpt-4o-mini@tool",
+            ]
+        )
+    if config.get_env("ANTHROPIC_API_KEY"):
+        default_models.extend(
+            [
+                "anthropic/claude-3-5-sonnet-20241022@tool",
+                "anthropic/claude-3-5-sonnet-20241022@markdown",
+                "anthropic/claude-3-5-sonnet-20241022@xml",
+                "anthropic/claude-3-5-haiku-20241022@tool",
+                "anthropic/claude-3-5-haiku-20241022@xml",
+            ]
+        )
+    if config.get_env("OPENROUTER_API_KEY"):
+        default_models.extend(
+            [
+                "openrouter/meta-llama/llama-3.1-70b-instruct@xml",
+                # "openrouter/meta-llama/llama-3.1-405b-instruct",
+            ]
+        )
+    if config.get_env("GEMINI_API_KEY"):
+        default_models.extend(["gemini/gemini-1.5-flash-latest"])
+
+    def parse_format(fmt: str) -> ToolFormat:
+        if fmt not in get_args(ToolFormat):
+            raise ValueError(f"Invalid tool format: {fmt}")
+        return cast(ToolFormat, fmt)
+
+    # Process model specifications
+    model_configs: list[tuple[str, ToolFormat]] = []
+    for model_spec in _model or default_models:
+        if "@" in model_spec:
+            model, fmt = model_spec.split("@", 1)
+            model_configs.append((model, parse_format(fmt)))
+        else:
+            # If no format specified for model, use either provided default or test all formats
+            formats: list[ToolFormat] = (
+                [cast(ToolFormat, tool_format)]
+                if tool_format
+                else ["markdown", "xml", "tool"]
+            )
+            for fmt in formats:
+                model_configs.append((model_spec, fmt))
 
     results_files = []
     for f in eval_names_or_result_files:
@@ -235,7 +296,7 @@ def main(
         evals_to_run = tests_default
 
     print("=== Running evals ===")
-    model_results = run_evals(evals_to_run, models, timeout, parallel)
+    model_results = run_evals(evals_to_run, model_configs, timeout, parallel)
     print("=== Finished ===")
 
     print("\n=== Model Results ===")
@@ -319,7 +380,10 @@ def write_results(model_results: dict[str, list[EvalResult]]):
         text=True,
         capture_output=True,
     ).stdout.strip()
-    results_dir = project_dir / "eval_results" / timestamp
+    eval_results_dir = Path(
+        os.environ.get("EVAL_RESULTS_DIR", project_dir / "eval_results")
+    )
+    results_dir = eval_results_dir / timestamp
     results_dir.mkdir(parents=True, exist_ok=True)
 
     csv_filename = results_dir / "eval_results.csv"

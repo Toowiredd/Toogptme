@@ -1,6 +1,8 @@
 .env*
-*venv
 .clean
+
+venv
+.venv
 
 projects
 demos
@@ -20,6 +22,7 @@ tests/output
 docs/_build
 .coverage*
 coverage.xml
+htmlcov
 junit.xml
 __pycache__
 .*cache
@@ -30,3 +33,5 @@ __pycache__
 *.gif
 *.cast
 *.png
+.aider*
+.env

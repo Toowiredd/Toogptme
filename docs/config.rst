@@ -11,8 +11,8 @@ It also supports environment variables for configuration, which take precedence 
 The CLI also supports a variety of options that can be used to override both configuration values and environment variables.
 
 
-Global configuration file
--------------------------
+Global config
+-------------
 
 The file is located at ``~/.config/gptme/config.toml``.
 
@@ -33,21 +33,29 @@ Here is an example:
     OPENAI_API_KEY = ""
     ANTHROPIC_API_KEY = ""
     OPENROUTER_API_KEY = ""
-    AZURE_OPENAI_API_KEY = ""
+    XAI_API_KEY = ""
+    GEMINI_API_KEY = ""
+    GROQ_API_KEY = ""
+    DEEPSEEK_API_KEY = ""
 
     # Uncomment to use with Ollama
     #MODEL = "local/<model-name>"
     #OPENAI_BASE_URL = "http://localhost:11434/v1"
 
+    # Uncomment to change tool configuration
+    #TOOL_FORMAT = "markdown" # Select the tool formal. One of `markdown`, `xml`, `tool`
+    #TOOL_ALLOWLIST = "save,append,patch,ipython,shell,browser"  # Comma separated list of allowed tools
+    #TOOL_MODULES = "gptme.tools,custom.tools" # List of python comma separated python module path
+
 The ``prompt`` section contains options for the prompt.
 
-The ``env`` section contains environment variables that gptme will fall back to if they are not set in the shell environment. This is useful for setting defaults for API keys and models.
+The ``env`` section contains environment variables that gptme will fall back to if they are not set in the shell environment. This is useful for setting the default model and API keys for :doc:`providers`.
 
 
-Project configuration file
---------------------------
+Project config
+--------------
 
-The project configuration file is intended to let the user configure how gptme works within a particular project.
+The project configuration file is intended to let the user configure how gptme works within a particular project/workspace.
 
 .. note::
 

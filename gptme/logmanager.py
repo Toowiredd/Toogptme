@@ -1,5 +1,7 @@
+import fcntl
 import json
 import logging
+import os
 import shutil
 import textwrap
 from collections.abc import Generator
@@ -8,14 +10,20 @@ from datetime import datetime
 from itertools import islice, zip_longest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Literal, TypeAlias
+from typing import (
+    Any,
+    Literal,
+    TextIO,
+    TypeAlias,
+)
 
 from rich import print
 
 from .dirs import get_logs_dir
 from .message import Message, len_tokens, print_msg
 from .prompts import get_prompt
-from .reduce import limit_log, reduce_log
+from .util.context import enrich_messages_with_context
+from .util.reduce import limit_log, reduce_log
 
 PathLike: TypeAlias = str | Path
 
@@ -65,14 +73,16 @@ class Log:
 class LogManager:
     """Manages a conversation log."""
 
+    _lock_fd: TextIO | None = None
+
     def __init__(
         self,
         log: list[Message] | None = None,
         logdir: PathLike | None = None,
         branch: str | None = None,
+        lock: bool = True,
     ):
         self.current_branch = branch or "main"
-
         if logdir:
             self.logdir = Path(logdir)
         else:
@@ -81,6 +91,25 @@ class LogManager:
             logger.warning(f"No logfile specified, using tmpfile at {fpath}")
             self.logdir = Path(fpath)
         self.name = self.logdir.name
+
+        # Create and optionally lock the directory
+        self.logdir.mkdir(parents=True, exist_ok=True)
+        is_pytest = "PYTEST_CURRENT_TEST" in os.environ
+        if lock and not is_pytest:
+            self._lockfile = self.logdir / ".lock"
+            self._lockfile.touch(exist_ok=True)
+            self._lock_fd = self._lockfile.open("w")
+
+            # Try to acquire an exclusive lock
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # logger.debug(f"Acquired lock on {self.logdir}")
+            except BlockingIOError:
+                self._lock_fd.close()
+                self._lock_fd = None
+                raise RuntimeError(
+                    f"Another gptme instance is using {self.logdir}"
+                ) from None
 
         # load branches from adjacent files
         self._branches = {self.current_branch: Log(log or [])}
@@ -97,7 +126,20 @@ class LogManager:
             if _branch not in self._branches:
                 self._branches[_branch] = Log.read_jsonl(file)
 
-        # TODO: Check if logfile has contents, then maybe load, or should it overwrite?
+    def __del__(self):
+        """Release the lock and close the file descriptor"""
+        if self._lock_fd:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+                # logger.debug(f"Released lock on {self.logdir}")
+            except Exception as e:
+                logger.warning(f"Error releasing lock: {e}")
+
+    @property
+    def workspace(self) -> Path:
+        """Path to workspace directory (resolves symlink if exists)."""
+        return (self.logdir / "workspace").resolve()
 
     @property
     def log(self) -> Log:
@@ -193,6 +235,7 @@ class LogManager:
         initial_msgs: list[Message] | None = None,
         branch: str = "main",
         create: bool = False,
+        lock: bool = True,
         **kwargs,
     ) -> "LogManager":
         """Loads a conversation log."""
@@ -213,7 +256,7 @@ class LogManager:
 
         if not Path(logfile).exists():
             if create:
-                logger.debug(f"Creating new logfile {logfile}")
+                # logger.debug(f"Creating new logfile {logfile}")
                 Path(logfile).parent.mkdir(parents=True, exist_ok=True)
                 Log([]).write_jsonl(logfile)
             else:
@@ -221,7 +264,7 @@ class LogManager:
 
         log = Log.read_jsonl(logfile)
         msgs = log.messages or initial_msgs or [get_prompt()]
-        return cls(msgs, logdir=logdir, branch=branch, **kwargs)
+        return cls(msgs, logdir=logdir, branch=branch, lock=lock, **kwargs)
 
     def branch(self, name: str) -> None:
         """Switches to a branch."""
@@ -304,19 +347,34 @@ class LogManager:
         return d
 
 
-def prepare_messages(msgs: list[Message]) -> list[Message]:
-    """Prepares the messages before sending to the LLM."""
+def prepare_messages(
+    msgs: list[Message], workspace: Path | None = None
+) -> list[Message]:
+    """
+    Prepares the messages before sending to the LLM.
+    - Takes the stored gptme conversation log
+    - Enhances it with context such as file contents
+    - Transforms it to the format expected by LLM providers
+    """
+    from .llm.models import get_model  # fmt: skip
+
+    # Enrich with enabled context enhancements (RAG, fresh context)
+    msgs = enrich_messages_with_context(msgs, workspace)
+
+    # Then reduce and limit as before
     msgs_reduced = list(reduce_log(msgs))
 
-    if len_tokens(msgs) != len_tokens(msgs_reduced):
-        logger.info(
-            f"Reduced log from {len_tokens(msgs)//1} to {len_tokens(msgs_reduced)//1} tokens"
-        )
+    model = get_model()
+    if (len_from := len_tokens(msgs, model.model)) != (
+        len_to := len_tokens(msgs_reduced, model.model)
+    ):
+        logger.info(f"Reduced log from {len_from//1} to {len_to//1} tokens")
     msgs_limited = limit_log(msgs_reduced)
     if len(msgs_reduced) != len(msgs_limited):
         logger.info(
             f"Limited log from {len(msgs_reduced)} to {len(msgs_limited)} messages"
         )
+
     return msgs_limited
 
 
@@ -331,12 +389,25 @@ def _conversation_files() -> list[Path]:
 
 @dataclass(frozen=True)
 class ConversationMeta:
+    """Metadata about a conversation."""
+
     name: str
     path: str
     created: float
     modified: float
     messages: int
     branches: int
+
+    def format(self, metadata=False) -> str:
+        """Format conversation metadata for display."""
+        output = f"{self.name}"
+        if metadata:
+            output += f"\nMessages: {self.messages}"
+            output += f"\nCreated:  {datetime.fromtimestamp(self.created)}"
+            output += f"\nModified: {datetime.fromtimestamp(self.modified)}"
+            if self.branches > 1:
+                output += f"\n({self.branches} branches)"
+        return output
 
 
 def get_conversations() -> Generator[ConversationMeta, None, None]:
@@ -366,6 +437,23 @@ def get_user_conversations() -> Generator[ConversationMeta, None, None]:
         ):
             continue
         yield conv
+
+
+def list_conversations(
+    limit: int = 20,
+    include_test: bool = False,
+) -> list[ConversationMeta]:
+    """
+    List conversations with a limit.
+
+    Args:
+        limit: Maximum number of conversations to return
+        include_test: Whether to include test conversations
+    """
+    conversation_iter = (
+        get_conversations() if include_test else get_user_conversations()
+    )
+    return list(islice(conversation_iter, limit))
 
 
 def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:

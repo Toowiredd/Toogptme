@@ -13,6 +13,10 @@ def get_readline_history_file() -> Path:
     return get_config_dir() / "history"
 
 
+def get_pt_history_file() -> Path:
+    return get_data_dir() / "history.pt"
+
+
 def get_data_dir() -> Path:
     # used in testing, so must take precedence
     if "XDG_DATA_HOME" in os.environ:
@@ -28,7 +32,10 @@ def get_data_dir() -> Path:
 
 def get_logs_dir() -> Path:
     """Get the path for **conversation logs** (not to be confused with the logger file)"""
-    path = get_data_dir() / "logs"
+    if "GPTME_LOGS_HOME" in os.environ:
+        path = Path(os.environ["GPTME_LOGS_HOME"])
+    else:
+        path = get_data_dir() / "logs"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

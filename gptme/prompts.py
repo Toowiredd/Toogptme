@@ -5,35 +5,37 @@ It is used to instruct the LLM about its role, how to use tools, and provide con
 When prompting, it is important to provide clear instructions and avoid any ambiguity.
 """
 
-import glob
 import logging
-import os
 import platform
-import subprocess
 from collections.abc import Generator, Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from .__version__ import __version__
 from .config import get_config, get_project_config
 from .message import Message
-from .tools import loaded_tools
-from .util import document_prompt_function
+from .tools import ToolFormat
+from .util import document_prompt_function, get_project_dir
 
 PromptType = Literal["full", "short"]
 
 logger = logging.getLogger(__name__)
 
 
-def get_prompt(prompt: PromptType | str = "full", interactive: bool = True) -> Message:
+def get_prompt(
+    prompt: PromptType | str = "full",
+    interactive: bool = True,
+    tool_format: ToolFormat = "markdown",
+) -> Message:
     """
     Get the initial system prompt.
     """
     msgs: Iterable
     if prompt == "full":
-        msgs = prompt_full(interactive)
+        msgs = prompt_full(interactive, tool_format)
     elif prompt == "short":
-        msgs = prompt_short(interactive)
+        msgs = prompt_short(interactive, tool_format)
     else:
         msgs = [Message("system", prompt)]
 
@@ -52,20 +54,25 @@ def _join_messages(msgs: list[Message]) -> Message:
     )
 
 
-def prompt_full(interactive: bool) -> Generator[Message, None, None]:
+def prompt_full(
+    interactive: bool, tool_format: ToolFormat
+) -> Generator[Message, None, None]:
     """Full prompt to start the conversation."""
     yield from prompt_gptme(interactive)
-    yield from prompt_tools()
+    yield from prompt_tools(tool_format=tool_format)
     if interactive:
         yield from prompt_user()
     yield from prompt_project()
     yield from prompt_systeminfo()
+    yield from prompt_timeinfo()
 
 
-def prompt_short(interactive: bool) -> Generator[Message, None, None]:
+def prompt_short(
+    interactive: bool, tool_format: ToolFormat
+) -> Generator[Message, None, None]:
     """Short prompt to start the conversation."""
     yield from prompt_gptme(interactive)
-    yield from prompt_tools(examples=False)
+    yield from prompt_tools(examples=False, tool_format=tool_format)
     if interactive:
         yield from prompt_user()
     yield from prompt_project()
@@ -85,7 +92,7 @@ def prompt_gptme(interactive: bool) -> Generator[Message, None, None]:
 
     base_prompt = f"""
 You are gptme v{__version__}, a general-purpose AI assistant powered by LLMs.
-You are designed to help users with programming tasks, such as writing code, debugging and learning new concepts.
+You are designed to help users with programming tasks, such as writing code, debugging, and learning new concepts.
 You can run code, execute terminal commands, and access the filesystem on the local machine.
 You will help the user with writing code, either from scratch or in existing projects.
 You will think step by step when solving a problem, in `<thinking>` tags.
@@ -98,7 +105,7 @@ If you receive feedback that your output or actions were incorrect, you should:
 - provide a corrected response
 
 You should learn about the context needed to provide the best help,
-such as exploring a potential project in the current working directory and reading the code using terminal tools.
+such as exploring the current working directory and reading the code using terminal tools.
 
 When suggesting code changes, prefer applying patches over examples. Preserve comments, unless they are no longer relevant.
 Use the patch tool to edit existing files, or the save tool to overwrite.
@@ -114,13 +121,14 @@ Always consider the full range of your available tools and abilities when approa
 
 Maintain a professional and efficient communication style. Be concise but thorough in your explanations.
 
-Think before you answer, in `<thinking>` tags.
+Use `<thinking>` tags to think before you answer.
 """.strip()
 
     interactive_prompt = """
 You are in interactive mode. The user is available to provide feedback.
 You should show the user how you can use your tools to write code, interact with the terminal, and access the internet.
 The user can execute the suggested commands so that you see their output.
+If the user aborted or interrupted an operation don't try it again, ask for clarification instead.
 If clarification is needed, ask the user.
 """.strip()
 
@@ -149,21 +157,18 @@ def prompt_user() -> Generator[Message, None, None]:
     about_user = config_prompt.get(
         "about_user", "You are interacting with a human programmer."
     )
-    response_preferences = config_prompt.get("response_preferences", {}).get(
-        "preferences", []
-    )
-
     response_prefs = (
-        "\n".join(f"- {pref}" for pref in response_preferences)
-        if response_preferences
-        else "No specific preferences set."
-    )
+        config_prompt.get("response_preference")
+        or config_prompt.get("preferences")
+        or "No specific preferences set."
+    ).strip()
 
     prompt_content = f"""# About User
 
 {about_user}
 
 ## User's Response Preferences
+
 {response_prefs}
 """
     yield Message("system", prompt_content)
@@ -173,22 +178,17 @@ def prompt_project() -> Generator[Message, None, None]:
     """
     Generate the project-specific prompt based on the current Git repository.
     """
-    config_prompt = get_config().prompt
-    try:
-        projectdir = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        project = os.path.basename(projectdir)
-    except subprocess.CalledProcessError:
-        logger.debug("Unable to determine Git repository root.")
+    projectdir = get_project_dir()
+    if not projectdir:
         return
 
-    project_info = config_prompt.get("project", {}).get(
-        project, "No specific project context provided."
-    )
+    project_config = get_project_config(projectdir)
+    config_prompt = get_config().prompt
+    project = projectdir.name
+    project_info = project_config and project_config.prompt
+    if not project_info:
+        # TODO: remove project preferences in global config? use only project config
+        project_info = config_prompt.get("project", {}).get(project)
 
     yield Message(
         "system",
@@ -196,20 +196,23 @@ def prompt_project() -> Generator[Message, None, None]:
     )
 
 
-def prompt_tools(examples: bool = True) -> Generator[Message, None, None]:
+def prompt_tools(
+    examples: bool = True, tool_format: ToolFormat = "markdown"
+) -> Generator[Message, None, None]:
     """Generate the tools overview prompt."""
-    assert loaded_tools, "No tools loaded"
-    prompt = "# Tools Overview"
-    for tool in loaded_tools:
-        prompt += f"\n\n## {tool.name}"
-        prompt += f"\n\n**Description:** {tool.desc}" if tool.desc else ""
-        prompt += (
-            f"\n\n**Instructions:** {tool.instructions}" if tool.instructions else ""
-        )
-        if tool.examples and examples:
-            prompt += f"\n\n### Examples\n\n{tool.examples}"
+    from .tools import get_tools  # fmt: skip
 
-    prompt += "\n\n*End of Tools List.*"
+    assert get_tools(), "No tools loaded"
+
+    use_tool = tool_format == "tool"
+
+    prompt = "# Tools aliases" if use_tool else "# Tools Overview"
+    for tool in get_tools():
+        if not use_tool or not tool.is_runnable():
+            prompt += tool.get_tool_prompt(examples, tool_format)
+
+    prompt += "\n\n*End of Tools aliases.*" if use_tool else "\n\n*End of Tools List.*"
+
     yield Message("system", prompt.strip() + "\n\n")
 
 
@@ -237,23 +240,39 @@ def prompt_systeminfo() -> Generator[Message, None, None]:
     )
 
 
+def prompt_timeinfo() -> Generator[Message, None, None]:
+    """Generate the current time prompt."""
+    # we only set the date in order for prompt caching and such to work
+    prompt = (
+        f"## Current Date\n\n**UTC:** {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    )
+    yield Message("system", prompt)
+
+
 def get_workspace_prompt(workspace: Path) -> str:
     # NOTE: needs to run after the workspace is initialized (i.e. initial prompt is constructed)
     # TODO: update this prompt if the files change
-    # TODO: include `git status/diff/log` summary, and keep it up-to-date
+    # TODO: include `git status -vv`, and keep it up-to-date
     if project := get_project_config(workspace):
-        files = []
-        for file in project.files:
+        files: list[Path] = []
+        for fileglob in project.files:
             # expand user
-            file = str(Path(file).expanduser())
+            fileglob = str(Path(fileglob).expanduser())
             # expand with glob
-            if new_files := glob.glob(file):
+            if new_files := workspace.glob(fileglob):
                 files.extend(new_files)
             else:
-                logger.error(f"File {file} specified in project config does not exist")
+                logger.error(
+                    f"File glob '{fileglob}' specified in project config does not match any files."
+                )
                 exit(1)
-        return "\n\nSelected project files, read more with cat:\n" + "\n\n".join(
-            [f"```{Path(file).name}\n{Path(file).read_text()}\n```" for file in files]
+        files_str = []
+        for file in files:
+            if file.exists():
+                files_str.append(f"```{file}\n{file.read_text()}\n```")
+        return (
+            "# Workspace Context\n\n"
+            "Selected project files, read more with cat:\n\n" + "\n\n".join(files_str)
         )
     return ""
 
@@ -261,5 +280,7 @@ def get_workspace_prompt(workspace: Path) -> str:
 document_prompt_function(interactive=True)(prompt_gptme)
 document_prompt_function()(prompt_user)
 document_prompt_function()(prompt_project)
-document_prompt_function()(prompt_tools)
+document_prompt_function(tool_format="markdown")(prompt_tools)
+# document_prompt_function(tool_format="xml")(prompt_tools)
+# document_prompt_function(tool_format="tool")(prompt_tools)
 document_prompt_function()(prompt_systeminfo)

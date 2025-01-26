@@ -1,6 +1,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import tomlkit
@@ -18,11 +19,11 @@ class Config:
     env: dict
 
     def get_env(self, key: str, default: str | None = None) -> str | None:
-        """Gets an enviromnent variable, checks the config file if it's not set in the environment."""
+        """Gets an environment variable, checks the config file if it's not set in the environment."""
         return os.environ.get(key) or self.env.get(key) or default
 
     def get_env_required(self, key: str) -> str:
-        """Gets an enviromnent variable, checks the config file if it's not set in the environment."""
+        """Gets an environment variable, checks the config file if it's not set in the environment."""
         if val := os.environ.get(key) or self.env.get(key):
             return val
         raise KeyError(  # pragma: no cover
@@ -40,7 +41,9 @@ class Config:
 class ProjectConfig:
     """Project-level configuration, such as which files to include in the context by default."""
 
+    prompt: str | None = None
     files: list[str] = field(default_factory=list)
+    rag: dict = field(default_factory=dict)
 
 
 ABOUT_ACTIVITYWATCH = """ActivityWatch is a free and open-source automated time-tracker that helps you track how you spend your time on your devices."""
@@ -72,12 +75,12 @@ _config: Config | None = None
 def get_config() -> Config:
     global _config
     if _config is None:
-        _config = load_config()
+        _config = _load_config()
     return _config
 
 
-def load_config() -> Config:
-    config = _load_config()
+def _load_config() -> Config:
+    config = _load_config_doc()
     assert "prompt" in config, "prompt key missing in config"
     assert "env" in config, "env key missing in config"
     prompt = config.pop("prompt")
@@ -87,7 +90,7 @@ def load_config() -> Config:
     return Config(prompt=prompt, env=env)
 
 
-def _load_config() -> tomlkit.TOMLDocument:
+def _load_config_doc() -> tomlkit.TOMLDocument:
     # Check if the config file exists
     if not os.path.exists(config_path):
         # If not, create it and write some default settings
@@ -105,7 +108,7 @@ def _load_config() -> tomlkit.TOMLDocument:
 
 
 def set_config_value(key: str, value: str) -> None:  # pragma: no cover
-    doc: TOMLDocument | Container = _load_config()
+    doc: TOMLDocument | Container = _load_config_doc()
 
     # Set the value
     keypath = key.split(".")
@@ -120,9 +123,10 @@ def set_config_value(key: str, value: str) -> None:  # pragma: no cover
 
     # Reload config
     global _config
-    _config = load_config()
+    _config = _load_config()
 
 
+@lru_cache
 def get_project_config(workspace: Path) -> ProjectConfig | None:
     project_config_paths = [
         p

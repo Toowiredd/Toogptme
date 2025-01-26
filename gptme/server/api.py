@@ -21,11 +21,10 @@ from flask_cors import CORS
 from ..commands import execute_cmd
 from ..dirs import get_logs_dir
 from ..llm import _stream
+from ..llm.models import get_model
 from ..logmanager import LogManager, get_user_conversations, prepare_messages
 from ..message import Message
-from ..models import get_model
-from ..tools import execute_msg
-from ..tools.base import ToolUse
+from ..tools import ToolUse, execute_msg, init_tools
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +46,7 @@ def api_conversations():
 @api.route("/api/conversations/<path:logfile>")
 def api_conversation(logfile: str):
     """Get a conversation."""
+    init_tools(None)  # FIXME: this is not thread-safe
     log = LogManager.load(logfile)
     return flask.jsonify(log.to_dict(branches=True))
 
@@ -78,6 +78,8 @@ def api_conversation_post(logfile: str):
     """Post a message to the conversation."""
     req_json = flask.request.json
     branch = (req_json or {}).get("branch", "main")
+    tool_allowlist = (req_json or {}).get("tools", None)
+    init_tools(tool_allowlist)  # FIXME: this is not thread-safe
     log = LogManager.load(logfile, branch=branch)
     assert req_json
     assert "role" in req_json
@@ -100,7 +102,7 @@ def api_conversation_generate(logfile: str):
     # get model or use server default
     req_json = flask.request.json or {}
     stream = req_json.get("stream", False)  # Default to no streaming (backward compat)
-    model = req_json.get("model", get_model().model)
+    model = req_json.get("model", get_model().full)
 
     # load conversation
     manager = LogManager.load(logfile, branch=req_json.get("branch", "main"))
@@ -116,7 +118,7 @@ def api_conversation_generate(logfile: str):
         # Non-streaming response
         try:
             # Get complete response
-            output = "".join(_stream(msgs, model))
+            output = "".join(_stream(msgs, model, tools=None))
 
             # Store the message
             msg = Message("assistant", output)
@@ -170,7 +172,9 @@ def api_conversation_generate(logfile: str):
 
             # Stream tokens from the model
             logger.debug(f"Starting token stream with model {model}")
-            for char in (char for chunk in _stream(msgs, model) for char in chunk):
+            for char in (
+                char for chunk in _stream(msgs, model, tools=None) for char in chunk
+            ):
                 output += char
                 # Send each token as a JSON event
                 yield f"data: {flask.json.dumps({'role': 'assistant', 'content': char, 'stored': False})}\n\n"

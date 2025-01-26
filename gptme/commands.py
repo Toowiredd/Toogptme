@@ -7,7 +7,8 @@ from time import sleep
 from typing import Literal
 
 from . import llm
-from .export import export_chat_to_html
+from .constants import INTERRUPT_CONTENT
+from .llm.models import MODELS, get_default_model, set_default_model
 from .logmanager import LogManager, prepare_messages
 from .message import (
     Message,
@@ -16,23 +17,30 @@ from .message import (
     print_msg,
     toml_to_msgs,
 )
-from .models import get_model
-from .tools import ToolUse, execute_msg, loaded_tools
-from .tools.base import ConfirmFunc
-from .useredit import edit_text_with_editor
+from .tools import (
+    ConfirmFunc,
+    ToolUse,
+    execute_msg,
+    get_tool_format,
+    get_tools,
+)
+from .util.cost import log_costs
+from .util.export import export_chat_to_html
+from .util.useredit import edit_text_with_editor
 
 logger = logging.getLogger(__name__)
 
 Actions = Literal[
-    "undo",
     "log",
-    "tools",
+    "undo",
     "edit",
     "rename",
     "fork",
-    "summarize",
+    "tools",
+    "model",
     "replay",
     "impersonate",
+    "summarize",
     "tokens",
     "export",
     "help",
@@ -43,14 +51,15 @@ action_descriptions: dict[Actions, str] = {
     "undo": "Undo the last action",
     "log": "Show the conversation log",
     "tools": "Show available tools",
+    "model": "List or switch models",
     "edit": "Edit the conversation in your editor",
     "rename": "Rename the conversation",
-    "fork": "Create a copy of the conversation with a new name",
+    "fork": "Copy the conversation using a new name",
     "summarize": "Summarize the conversation",
-    "replay": "Re-execute codeblocks in the conversation, wont store output in log",
+    "replay": "Rerun tools in the conversation, won't store output",
     "impersonate": "Impersonate the assistant",
     "tokens": "Show the number of tokens used",
-    "export": "Export conversation as standalone HTML",
+    "export": "Export conversation as HTML",
     "help": "Show this help message",
     "exit": "Exit the program",
 }
@@ -100,10 +109,10 @@ def handle_cmd(
             new_name = args[0] if args else input("New name: ")
             manager.fork(new_name)
         case "summarize":
+            manager.undo(1, quiet=True)
             msgs = prepare_messages(manager.log.messages)
             msgs = [m for m in msgs if not m.hide]
-            summary = llm.summarize(msgs)
-            print(f"Summary: {summary}")
+            print_msg(llm.summarize(msgs))
         case "edit":
             # edit previous messages
             # first undo the '/edit' command itself
@@ -134,23 +143,42 @@ def handle_cmd(
             yield from execute_msg(msg, confirm=lambda _: True)
         case "tokens":
             manager.undo(1, quiet=True)
-            n_tokens = len_tokens(manager.log.messages)
-            print(f"Tokens used: {n_tokens}")
-            model = get_model()
-            if model:
-                print(f"Model: {model.model}")
-                if model.price_input:
-                    print(f"Cost (input): ${n_tokens * model.price_input / 1_000_000}")
+            log_costs(manager.log.messages)
         case "tools":
             manager.undo(1, quiet=True)
             print("Available tools:")
-            for tool in loaded_tools:
+            for tool in get_tools():
                 print(
                     f"""
   # {tool.name}
     {tool.desc.rstrip(".")}
-    tokens (example): {len_tokens(tool.examples)}"""
+    tokens (example): {len_tokens(tool.get_examples(get_tool_format()), "gpt-4")}"""
                 )
+        case "model" | "models":
+            manager.undo(1, quiet=True)
+            if args:
+                set_default_model(args[0])
+                print(f"Set model to {args[0]}")
+            else:
+                model = get_default_model()
+                assert model
+                print(f"Current model: {model.full}")
+                print(
+                    f"  price: input ${model.price_input}/Mtok, output ${model.price_output}/Mtok"
+                )
+                print(f"  context: {model.context}, max output: {model.max_output}")
+                print(
+                    f"  (streaming: {model.supports_streaming}, vision: {model.supports_vision})"
+                )
+                # TODO: list known models
+                for provider in MODELS:
+                    if not MODELS[provider]:
+                        continue
+                    print(f"{provider}/")
+                    for model_name in list(MODELS[provider].keys())[:10]:
+                        print(f"  {model_name}")
+                    if len(MODELS[provider]) > 10:
+                        print(f"  ... ({len(MODELS[provider]) - 10} more)")
         case "export":
             manager.undo(1, quiet=True)
             manager.write()
@@ -173,6 +201,7 @@ def handle_cmd(
                     manager.write()
                     help()
                 else:
+                    manager.undo(1, quiet=True)
                     print("Unknown command")
 
 
@@ -189,7 +218,7 @@ def edit(manager: LogManager) -> Generator[Message, None, None]:  # pragma: no c
             try:
                 sleep(1)
             except KeyboardInterrupt:
-                yield Message("system", "Interrupted")
+                yield Message("system", INTERRUPT_CONTENT)
                 return
     manager.edit(list(reversed(res)))
     print("Applied edited messages, write /log to see the result")
@@ -226,7 +255,7 @@ def _gen_help(incl_langtags: bool = True) -> Generator[str, None, None]:
         yield "  /python print('hello')"
         yield ""
         yield "Supported langtags:"
-        for tool in loaded_tools:
+        for tool in get_tools():
             if tool.block_types:
                 yield f"  - {tool.block_types[0]}" + (
                     f"  (alias: {', '.join(tool.block_types[1:])})"

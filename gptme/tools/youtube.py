@@ -5,8 +5,7 @@ from .base import ToolSpec
 logger = logging.getLogger(__name__)
 
 try:
-    # noreorder
-    from youtube_transcript_api import YouTubeTranscriptApi  # fmt: skip
+    from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore # fmt: skip
 except ImportError:
     YouTubeTranscriptApi = None
 
@@ -32,9 +31,6 @@ def summarize_transcript(transcript: str) -> str:
 tool: ToolSpec = ToolSpec(
     name="youtube",
     desc="Fetch and summarize YouTube video transcripts",
-    instructions="""
-    To use this tool, provide a YouTube video ID and specify whether you want the transcript or a summary.
-    """,
     functions=[get_transcript, summarize_transcript],
     block_types=["youtube"],
     available=bool(YouTubeTranscriptApi),

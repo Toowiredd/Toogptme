@@ -9,50 +9,71 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..message import Message
-from ..util import print_preview
-from .base import ConfirmFunc, ToolSpec, ToolUse
+from ..util.ask_execute import execute_with_confirmation
+from .base import (
+    ConfirmFunc,
+    Parameter,
+    ToolSpec,
+    ToolUse,
+    get_path,
+)
 
-instructions = f"""
+instructions = """
 To patch/modify files, we use an adapted version of git conflict markers.
 
 This can be used to edit files, without having to rewrite the whole file.
-Only one patch block can be written per codeblock. Extra ORIGINAL/UPDATED blocks will be ignored.
+Only one patch block can be written per tool use. Extra ORIGINAL/UPDATED blocks will be ignored.
 Try to keep the patch as small as possible. Avoid placeholders, as they may make the patch fail.
 
 To keep the patch small, try to scope the patch to imports/function/class.
 If the patch is large, consider using the save tool to rewrite the whole file.
+""".strip()
+
+instructions_format = {
+    "markdown": f"""
+The $PATH parameter MUST be on the same line as the code block start, not on the line after.
 
 The patch block should be written in the following format:
 
-{ToolUse("patch", ["$FILENAME"], '''
+{ToolUse("patch", ["$PATH"], '''
 <<<<<<< ORIGINAL
 $ORIGINAL_CONTENT
 =======
 $UPDATED_CONTENT
 >>>>>>> UPDATED
-'''.strip()).to_output()}
-"""
+'''.strip()).to_output("markdown")}
+""",
+    "tool": "The `patch` parameter must be a string containing conflict markers without any code block.",
+}
 
 ORIGINAL = "<<<<<<< ORIGINAL\n"
 DIVIDER = "\n=======\n"
 UPDATED = "\n>>>>>>> UPDATED"
 
-
-examples = f"""
-> User: patch the file `hello.py` to ask for the name of the user
-> Assistant:
-{ToolUse("patch", ["hello.py"], '''
+patch_content = """
 <<<<<<< ORIGINAL
-def hello():
     print("Hello world")
 =======
-def hello():
     name = input("What is your name? ")
     print(f"Hello {name}")
 >>>>>>> UPDATED
-'''.strip()).to_output()}
+""".strip()
+
+
+def examples(tool_format):
+    return f"""
+> User: patch `src/hello.py` to ask for the name of the user
+```src/hello.py
+def hello():
+    print("Hello world")
+
+if __name__ == "__main__":
+    hello()
+```
+> Assistant:
+{ToolUse("patch", ["src/hello.py"], patch_content).to_output(tool_format)}
 > System: Patch applied
-"""
+""".strip()
 
 
 @dataclass
@@ -112,14 +133,26 @@ class Patch:
             if ORIGINAL not in patch:  # pragma: no cover
                 raise ValueError(f"invalid patch, no `{ORIGINAL.strip()}`", patch)
 
-            parts = re.split(
-                f"{re.escape(ORIGINAL)}|{re.escape(DIVIDER)}|{re.escape(UPDATED)}",
-                patch,
-            )
-            if len(parts) != 4:  # pragma: no cover
-                raise ValueError("invalid patch format")
+            # First split on ORIGINAL to get the content after it
+            _, after_original = re.split(re.escape(ORIGINAL), patch, maxsplit=1)
 
-            _, original, modified, _ = parts
+            # Then split on DIVIDER to get the original content
+            if DIVIDER not in after_original:  # pragma: no cover
+                raise ValueError("invalid patch format: missing =======")
+            original, after_divider = re.split(
+                re.escape(DIVIDER), after_original, maxsplit=1
+            )
+
+            # Finally split on UPDATED to get the modified content
+            # Use UPDATED[1:] to ignore the leading newline in the marker,
+            # allowing us to detect truly empty content between ======= and >>>>>>> UPDATED
+            if after_divider.startswith(UPDATED[1:]):
+                # Special case: empty content followed immediately by UPDATED marker
+                modified = ""
+            else:
+                if UPDATED not in after_divider:  # pragma: no cover
+                    raise ValueError("invalid patch format: missing >>>>>>> UPDATED")
+                modified, _ = re.split(re.escape(UPDATED), after_divider, maxsplit=1)
             yield Patch(original, modified)
 
     @classmethod
@@ -152,63 +185,78 @@ def apply(codeblock: str, content: str) -> str:
     return new_content
 
 
-def execute_patch(
-    code: str,
-    args: list[str],
-    confirm: ConfirmFunc,
-) -> Generator[Message, None, None]:
-    """
-    Applies the patch.
-    """
-    fn = " ".join(args)
-    if not fn:
-        yield Message("system", "No path provided")
-        return
-
-    path = Path(fn).expanduser()
-    if not path.exists():
-        yield Message("system", f"File not found: {fn}")
-        return
-
+def preview_patch(content: str, path: Path | None) -> str | None:
+    """Prepare preview content for patch operation."""
     try:
-        patches = Patch.from_codeblock(code)
-        patches_str = "\n\n".join(p.diff_minimal() for p in patches)
+        patches = Patch.from_codeblock(content)
+        return "\n@@@\n".join(p.diff_minimal() for p in patches)
     except ValueError as e:
-        yield Message("system", f"Patch failed: {e.args[0]}")
-        return
+        raise ValueError(f"Invalid patch: {e.args[0]}") from None
 
-    # TODO: display minimal patches
-    # TODO: include patch headers to delimit multiple patches
-    print_preview(patches_str, lang="diff")
 
-    if not confirm(f"Apply patch to {fn}?"):
-        print("Patch not applied")
-        return
-
+def execute_patch_impl(
+    content: str, path: Path | None, confirm: ConfirmFunc
+) -> Generator[Message, None, None]:
+    """Actual patch implementation."""
+    assert path is not None
     try:
         with open(path) as f:
             original_content = f.read()
 
         # Apply the patch
-        patched_content = apply(code, original_content)
-        # TODO: if the patch is inefficient, replace request to use minimal unique patch
-        with open(path, "w") as f:
-            f.write(patched_content)
+        patched_content = apply(content, original_content)
 
-        # Compare token counts
-        patch_len = len(code)
+        # Compare token counts and generate warnings
+        patch_len = len(content)
         full_file_len = len(patched_content)
-
         warnings = []
         if 1000 < full_file_len < patch_len:
             warnings.append(
                 "Note: The patch was big and larger than the file. In the future, try writing smaller patches or use the save tool instead."
             )
-        warnings_str = ("\n".join(warnings) + "\n") if warnings else ""
 
-        yield Message("system", f"{warnings_str}Patch successfully applied to {fn}")
-    except (ValueError, FileNotFoundError) as e:
-        yield Message("system", f"Patch failed: {e.args[0]}")
+        # Write the patched content
+        with open(path, "w") as f:
+            f.write(patched_content)
+
+        # Return success message with any warnings
+        warnings_str = ("\n".join(warnings) + "\n") if warnings else ""
+        yield Message("system", f"{warnings_str}Patch successfully applied to {path}")
+
+    except FileNotFoundError:
+        raise ValueError(
+            f"Patch failed: No such file or directory '{path}' (pwd: {Path.cwd()})"
+        ) from None
+    except ValueError as e:
+        raise ValueError(f"Patch failed: {e.args[0]}") from None
+
+
+def execute_patch(
+    code: str | None,
+    args: list[str] | None,
+    kwargs: dict[str, str] | None,
+    confirm: ConfirmFunc = lambda _: True,
+) -> Generator[Message, None, None]:
+    """Applies the patch."""
+    if code is None and kwargs is not None:
+        code = kwargs.get("patch", code)
+
+    if not code:
+        yield Message("system", "No patch provided by the assistant")
+        return
+
+    yield from execute_with_confirmation(
+        code,
+        args,
+        kwargs,
+        confirm,
+        execute_fn=execute_patch_impl,
+        get_path_fn=get_path,
+        preview_fn=preview_patch,
+        preview_lang="diff",
+        confirm_msg=f"Apply patch to {get_path(code, args, kwargs)}?",
+        allow_edit=True,
+    )
 
 
 tool = ToolSpec(
@@ -218,5 +266,19 @@ tool = ToolSpec(
     examples=examples,
     execute=execute_patch,
     block_types=["patch"],
+    parameters=[
+        Parameter(
+            name="path",
+            type="string",
+            description="The path of the file to patch.",
+            required=True,
+        ),
+        Parameter(
+            name="patch",
+            type="string",
+            description=f"The patch to apply. Use conflict markers! Example:\n{patch_content}",
+            required=True,
+        ),
+    ],
 )
 __doc__ = tool.get_doc(__doc__)

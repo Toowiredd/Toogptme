@@ -1,5 +1,5 @@
-import base64
 import dataclasses
+import hashlib
 import logging
 import shutil
 import sys
@@ -7,7 +7,7 @@ import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import tomlkit
 from rich.syntax import Syntax
@@ -16,18 +16,10 @@ from typing_extensions import Self
 
 from .codeblock import Codeblock
 from .constants import ROLE_COLOR
-from .models import Provider
-from .util import console, get_tokenizer, rich_to_str
+from .util import console, get_tokenizer
+from .util.prompt import rich_to_str
 
 logger = logging.getLogger(__name__)
-
-# max tokens allowed in a single system message
-# if you hit this limit, you and/or I f-ed up, and should make the message shorter
-# maybe we should make it possible to store long outputs in files, and link/summarize it/preview it in the message
-max_system_len = 20000
-
-
-ProvidersWithFiles: list[Provider] = ["openai", "anthropic", "openrouter"]
 
 
 @dataclass(frozen=True, eq=False)
@@ -53,12 +45,10 @@ class Message:
     quiet: bool = False
     timestamp: datetime = field(default_factory=datetime.now)
     files: list[Path] = field(default_factory=list)
+    call_id: str | None = None
 
     def __post_init__(self):
         assert isinstance(self.timestamp, datetime)
-        if self.role == "system":
-            if (length := len_tokens(self)) >= max_system_len:
-                logger.warning(f"System message too long: {length} tokens")
 
     def __repr__(self):
         content = textwrap.shorten(self.content, 20, placeholder="...")
@@ -78,94 +68,12 @@ class Message:
         """Replace attributes of the message."""
         return dataclasses.replace(self, **kwargs)
 
-    def _content_files_list(
-        self,
-        provider: Provider,
-    ) -> list[dict[str, Any]]:
-        # only these providers support files in the content
-        if provider not in ProvidersWithFiles:
-            raise ValueError("Provider does not support files in the content")
-
-        # combines a content message with a list of files
-        content: list[dict[str, Any]] = (
-            self.content
-            if isinstance(self.content, list)
-            else [{"type": "text", "text": self.content}]
-        )
-        allowed_file_exts = ["jpg", "jpeg", "png", "gif"]
-
-        for f in self.files:
-            ext = f.suffix[1:]
-            if ext not in allowed_file_exts:
-                logger.warning("Unsupported file type: %s", ext)
-                continue
-            if ext == "jpg":
-                ext = "jpeg"
-            media_type = f"image/{ext}"
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"![{f.name}]({f.name}):",
-                }
-            )
-
-            # read file
-            data_bytes = f.read_bytes()
-            data = base64.b64encode(data_bytes).decode("utf-8")
-
-            # check that the file is not too large
-            # anthropic limit is 5MB, seems to measure the base64-encoded size instead of raw bytes
-            # TODO: use compression to reduce file size
-            # print(f"{len(data)=}")
-            if len(data) > 5_000_000:
-                content.append(
-                    {
-                        "type": "text",
-                        "text": "Image size exceeds 5MB. Please upload a smaller image.",
-                    }
-                )
-                continue
-
-            if provider == "anthropic":
-                content.append(
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": data,
-                        },
-                    }
-                )
-            elif provider == "openai":
-                # OpenAI format
-                content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{media_type};base64,{data}"},
-                    }
-                )
-            else:
-                # Storage/wire format (keep files in `files` list)
-                # Do nothing to integrate files into the message content
-                pass
-
-        return content
-
-    def to_dict(self, keys=None, provider: Provider | None = None) -> dict:
+    def to_dict(self, keys=None) -> dict:
         """Return a dict representation of the message, serializable to JSON."""
-        content: str | list[dict[str, Any]]
-        if provider in ProvidersWithFiles:
-            # OpenAI/Anthropic format should include files in the content
-            # Some otherwise OpenAI-compatible providers (groq, deepseek?) do not support this
-            content = self._content_files_list(provider)
-        else:
-            # storage/wire format should keep the content as a string
-            content = self.content
 
         d: dict = {
             "role": self.role,
-            "content": content,
+            "content": self.content,
             "timestamp": self.timestamp.isoformat(),
         }
         if self.files:
@@ -174,8 +82,10 @@ class Message:
             d["pinned"] = True
         if self.hide:
             d["hide"] = True
+        if self.call_id:
+            d["call_id"] = self.call_id
         if keys:
-            return {k: d[k] for k in keys}
+            return {k: d[k] for k in keys if k in d}
         return d
 
     def to_xml(self) -> str:
@@ -183,7 +93,30 @@ class Message:
         attrs = f"role='{self.role}'"
         return f"<message {attrs}>\n{self.content}\n</message>"
 
-    def format(self, oneline: bool = False, highlight: bool = False) -> str:
+    def format(
+        self,
+        oneline: bool = False,
+        highlight: bool = False,
+        max_length: int | None = None,
+    ) -> str:
+        """Format the message for display.
+
+        Args:
+            oneline: Whether to format the message as a single line
+            highlight: Whether to highlight code blocks
+            max_length: Maximum length of the message. If None, no truncation is applied.
+                       If set, will truncate at first newline or max_length, whichever comes first.
+        """
+        if max_length is not None:
+            first_newline = self.content.find("\n")
+            max_length = (
+                min(max_length, first_newline) if first_newline != -1 else max_length
+            )
+            content = self.content[:max_length]
+            if len(content) < len(self.content):
+                content += "..."
+            temp_msg = self.replace(content=content)
+            return format_msgs([temp_msg], oneline=True, highlight=highlight)[0]
         return format_msgs([self], oneline=oneline, highlight=highlight)[0]
 
     def print(self, oneline: bool = False, highlight: bool = True) -> None:
@@ -212,6 +145,7 @@ content = """
 {content}
 """
 timestamp = "{self.timestamp.isoformat()}"
+call_id = "{self.call_id}"
 {extra}
 '''
 
@@ -234,6 +168,7 @@ timestamp = "{self.timestamp.isoformat()}"
             hide=msg.get("hide", False),
             files=[Path(f) for f in msg.get("files", [])],
             timestamp=datetime.fromisoformat(msg["timestamp"]),
+            call_id=msg.get("call_id", None),
         )
 
     def get_codeblocks(self) -> list[Codeblock]:
@@ -252,6 +187,15 @@ timestamp = "{self.timestamp.isoformat()}"
             return []
 
         return Codeblock.iter_from_markdown(content_str)
+
+    def cost(self, model: str | None = None, output=False) -> float:
+        """Get the input cost of the message in USD."""
+        from .llm.models import get_model  # noreorder
+
+        m = get_model(model)
+        tok = len_tokens(self, f"{m.provider}/{m.model}")
+        price = (m.price_output if output else m.price_input) / 1_000_000
+        return tok * price
 
 
 def format_msgs(
@@ -284,8 +228,15 @@ def format_msgs(
                     output += textwrap.indent(block, prefix=indent * " ")
                     continue
                 elif highlight:
-                    lang = block.split("\n")[0]
-                    block = rich_to_str(Syntax(block.rstrip(), lang))
+                    lang = block.split("\n", 1)[0]
+                    content = block.split("\n", 1)[-1]
+                    fmt = "underline blue"
+                    block = f"[{fmt}]{lang}\n[/{fmt}]" + rich_to_str(
+                        Syntax(
+                            content.rstrip().replace("[", r"\["),
+                            lang,
+                        )
+                    )
                 output += f"```{block.rstrip()}\n```"
         outputs.append(f"{userprefix}: {output.rstrip()}")
     return outputs
@@ -352,16 +303,46 @@ def toml_to_msgs(toml: str) -> list[Message]:
     ]
 
 
-def msgs2dicts(msgs: list[Message], provider: Provider) -> list[dict]:
+def msgs2dicts(msgs: list[Message]) -> list[dict]:
     """Convert a list of Message objects to a list of dicts ready to pass to an LLM."""
-    return [msg.to_dict(keys=["role", "content"], provider=provider) for msg in msgs]
+    return [msg.to_dict(keys=["role", "content", "files", "call_id"]) for msg in msgs]
 
 
-# TODO: remove model assumption
-def len_tokens(content: str | Message | list[Message], model: str = "gpt-4") -> int:
-    """Get the number of tokens in a string, message, or list of messages."""
+# Global cache mapping hashes to token counts
+_token_cache: dict[tuple[str, str], int] = {}
+
+
+def _hash_content(content: str) -> str:
+    """Create a hash of the content"""
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def len_tokens(content: str | Message | list[Message], model: str) -> int:
+    """Get the number of tokens in a string, message, or list of messages.
+
+    Uses efficient caching with content hashing to minimize memory usage while
+    maintaining fast repeated calculations, which is especially important for
+    conversations with many messages.
+    """
     if isinstance(content, list):
-        return sum(len_tokens(msg.content, model) for msg in content)
+        return sum(len_tokens(msg, model) for msg in content)
     if isinstance(content, Message):
-        return len_tokens(content.content, model)
-    return len(get_tokenizer(model).encode(content))
+        content = content.content
+
+    assert isinstance(content, str), content
+    # Check cache using hash
+    content_hash = _hash_content(content)
+    cache_key = (content_hash, model)
+    if cache_key in _token_cache:
+        return _token_cache[cache_key]
+
+    # Calculate and cache
+    count = len(get_tokenizer(model).encode(content))
+    _token_cache[cache_key] = count
+
+    # Limit cache size by removing oldest entries if needed
+    if len(_token_cache) > 1000:
+        # Remove first item (oldest in insertion order)
+        _token_cache.pop(next(iter(_token_cache)))
+
+    return count

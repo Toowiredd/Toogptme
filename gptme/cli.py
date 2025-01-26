@@ -1,4 +1,3 @@
-import importlib.metadata
 import logging
 import os
 import signal
@@ -11,25 +10,31 @@ from typing import Literal
 import click
 from pick import pick
 
+
 from .chat import chat
+from .config import get_config
 from .commands import _gen_help
 from .constants import MULTIPROMPT_SEPARATOR
 from .dirs import get_logs_dir
 from .init import init_logging
-from .interrupt import handle_keyboard_interrupt, set_interruptible
+from .llm.models import get_recommended_model
 from .logmanager import ConversationMeta, get_user_conversations
 from .message import Message
 from .prompts import get_prompt
-from .readline import add_history
-from .tools import all_tools, init_tools
-from .util import epoch_to_age, generate_name
+from .tools import ToolFormat, init_tools, get_available_tools
+from .util import epoch_to_age
+from .util.generate_name import generate_name
+from .util.interrupt import handle_keyboard_interrupt, set_interruptible
+from .util.prompt import add_history
 
 logger = logging.getLogger(__name__)
 
 
 script_path = Path(os.path.realpath(__file__))
 commands_help = "\n".join(_gen_help(incl_langtags=False))
-available_tool_names = ", ".join([tool.name for tool in all_tools if tool.available])
+available_tool_names = ", ".join(
+    sorted([tool.name for tool in get_available_tools() if tool.available])
+)
 
 
 docstring = f"""
@@ -52,7 +57,6 @@ The interface provides user commands that can be used to interact with the syste
     nargs=-1,
 )
 @click.option(
-    "-n",
     "--name",
     default="random",
     help="Name of conversation. Defaults to generating a random name.",
@@ -61,7 +65,7 @@ The interface provides user commands that can be used to interact with the syste
     "-m",
     "--model",
     default=None,
-    help="Model to use, e.g. openai/gpt-4o, anthropic/claude-3-5-sonnet-20240620. If only provider given, a default is used.",
+    help=f"Model to use, e.g. openai/{get_recommended_model('openai')}, anthropic/{get_recommended_model('anthropic')}. If only provider given then a default is used.",
 )
 @click.option(
     "-w",
@@ -87,7 +91,7 @@ The interface provides user commands that can be used to interact with the syste
     "interactive",
     default=True,
     flag_value=False,
-    help="Force non-interactive mode. Implies --no-confirm.",
+    help="Non-interactive mode. Implies --no-confirm.",
 )
 @click.option(
     "--system",
@@ -102,6 +106,12 @@ The interface provides user commands that can be used to interact with the syste
     default=None,
     multiple=True,
     help=f"Comma-separated list of tools to allow. Available: {available_tool_names}.",
+)
+@click.option(
+    "--tool-format",
+    "tool_format",
+    default=None,
+    help="Tool parsing method. Can be 'markdown', 'xml', 'tool'. (experimental)",
 )
 @click.option(
     "--no-stream",
@@ -132,6 +142,7 @@ def main(
     name: str,
     model: str | None,
     tool_allowlist: list[str] | None,
+    tool_format: ToolFormat | None,
     stream: bool,
     verbose: bool,
     no_confirm: bool,
@@ -144,7 +155,9 @@ def main(
     """Main entrypoint for the CLI."""
     if version:
         # print version
-        print(f"gptme {importlib.metadata.version('gptme')}")
+        from . import __version__
+
+        print(f"gptme v{__version__}")
 
         # print dirs
         print(f"Logs dir: {get_logs_dir()}")
@@ -167,33 +180,48 @@ def main(
         # split comma-separated values
         tool_allowlist = [tool for tools in tool_allowlist for tool in tools.split(",")]
 
+    config = get_config()
+
+    selected_tool_format: ToolFormat = (
+        tool_format or config.get_env("TOOL_FORMAT") or "markdown"  # type: ignore
+    )
+
     # early init tools to generate system prompt
-    init_tools(tool_allowlist)
+    init_tools(frozenset(tool_allowlist) if tool_allowlist else None)
 
     # get initial system prompt
-    initial_msgs = [get_prompt(prompt_system, interactive=interactive)]
+    initial_msgs = [
+        get_prompt(
+            prompt_system,
+            interactive=interactive,
+            tool_format=selected_tool_format,
+        )
+    ]
 
     # if stdin is not a tty, we might be getting piped input, which we should include in the prompt
     was_piped = False
+    piped_input = None
     if not sys.stdin.isatty():
         # fetch prompt from stdin
-        prompt_stdin = _read_stdin()
-        if prompt_stdin:
-            # TODO: also append if existing convo loaded/resumed
-            initial_msgs += [Message("system", f"```stdin\n{prompt_stdin}\n```")]
+        piped_input = _read_stdin()
+        if piped_input:
             was_piped = True
 
             # Attempt to switch to interactive mode
-            sys.stdin.close()
-            try:
-                sys.stdin = open("/dev/tty")
-            except OSError:
-                # if we can't open /dev/tty, we're probably in a CI environment, so we should just continue
-                logger.warning(
-                    "Failed to switch to interactive mode, continuing in non-interactive mode"
-                )
+            # https://github.com/prompt-toolkit/python-prompt-toolkit/issues/502#issuecomment-466591259
+            sys.stdin = sys.stdout
 
-    # add prompts to readline history
+            # Old code, doesn't work with prompt-toolkit
+            # sys.stdin.close()
+            # try:
+            #     sys.stdin = open("/dev/tty")
+            # except OSError:
+            #     # if we can't open /dev/tty, we're probably in a CI environment, so we should just continue
+            #     logger.warning(
+            #         "Failed to switch to interactive mode, continuing in non-interactive mode"
+            #     )
+
+    # add prompts to prompt-toolkit history
     for prompt in prompts:
         if prompt and len(prompt) > 1000:
             # skip adding long prompts to history (slows down startup, unlikely to be useful)
@@ -206,8 +234,22 @@ def main(
     # TODO: referenced file paths in multiprompts should be read when run, not when parsed
     prompt_msgs = [Message("user", p) for p in prompts]
 
+    def inject_stdin(prompt_msgs, piped_input: str | None) -> list[Message]:
+        # if piped input, append it to first prompt, or create a new prompt if none exists
+        if not piped_input:
+            return prompt_msgs
+        stdin_msg = Message("user", f"```stdin\n{piped_input}\n```")
+        if not prompt_msgs:
+            prompt_msgs.append(stdin_msg)
+        else:
+            prompt_msgs[0] = prompt_msgs[0].replace(
+                content=f"{prompt_msgs[0].content}\n\n{stdin_msg.content}"
+            )
+        return prompt_msgs
+
     if resume:
         logdir = get_logdir_resume()
+        prompt_msgs = inject_stdin(prompt_msgs, piped_input)
     # don't run pick in tests/non-interactive mode, or if the user specifies a name
     elif (
         interactive
@@ -219,6 +261,7 @@ def main(
         logdir = pick_log()
     else:
         logdir = get_logdir(name)
+        prompt_msgs = inject_stdin(prompt_msgs, piped_input)
 
     if workspace == "@log":
         workspace_path: Path | None = logdir / "workspace"
@@ -231,18 +274,23 @@ def main(
     set_interruptible()  # prepare, user should be able to Ctrl+C until user prompt ready
     signal.signal(signal.SIGINT, handle_keyboard_interrupt)
 
-    chat(
-        prompt_msgs,
-        initial_msgs,
-        logdir,
-        model,
-        stream,
-        no_confirm,
-        interactive,
-        show_hidden,
-        workspace_path,
-        tool_allowlist,
-    )
+    try:
+        chat(
+            prompt_msgs,
+            initial_msgs,
+            logdir,
+            model,
+            stream,
+            no_confirm,
+            interactive,
+            show_hidden,
+            workspace_path,
+            tool_allowlist,
+            selected_tool_format,
+        )
+    except RuntimeError as e:
+        logger.error(e)
+        sys.exit(1)
 
 
 def get_name(name: str) -> str:

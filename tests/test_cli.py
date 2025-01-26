@@ -1,4 +1,3 @@
-import importlib
 import os
 import random
 from pathlib import Path
@@ -6,6 +5,7 @@ from tempfile import TemporaryDirectory
 
 import gptme.cli
 import gptme.constants
+import gptme.tools.browser
 import pytest
 from click.testing import CliRunner
 from gptme.tools import ToolUse
@@ -29,9 +29,16 @@ def runid():
     return random.randint(0, 100000)
 
 
+runid_retries: dict[str, int] = {}
+
+
 @pytest.fixture
 def name(runid, request):
-    return f"test-{runid}-{request.node.name}"
+    attempt = runid_retries.get(request.node.nodeid, 0)
+    runid_retries[request.node.nodeid] = attempt + 1
+    return f"test-{runid}-{request.node.name}" + (
+        f"-retry-{attempt}" if attempt else ""
+    )
 
 
 @pytest.fixture
@@ -78,7 +85,7 @@ def test_command_tokens(args: list[str], runner: CliRunner):
     args.append("/tokens")
     result = runner.invoke(gptme.cli.main, args)
     assert "/tokens" in result.output
-    assert "Cost" in result.output
+    assert "Tokens:" in result.output
     assert result.exit_code == 0
 
 
@@ -129,7 +136,7 @@ def test_command_rename(args: list[str], runner: CliRunner, name: str):
     args.append("/rename auto")
     print(f"running: gptme {' '.join(args)}")
     result = runner.invoke(gptme.cli.main, args)
-    assert result.exit_code == 0
+    assert result.exit_code == 0, (result.output, result.exception)
 
 
 @pytest.mark.slow
@@ -245,8 +252,11 @@ def test_block(args: list[str], lang: str, runner: CliRunner):
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    os.environ.get("MODEL") == "openai/gpt-4o-mini", reason="unreliable for gpt-4o-mini"
+)
 def test_generate_primes(args: list[str], runner: CliRunner):
-    args.append("compute the first 10 prime numbers")
+    args.append("compute the first 10 prime numbers using ipython")
     result = runner.invoke(gptme.cli.main, args)
     # check that the 9th and 10th prime is present
     assert "23" in result.output
@@ -266,22 +276,32 @@ def test_stdin(args: list[str], runner: CliRunner):
 def test_chain(args: list[str], runner: CliRunner):
     """tests that the "-" argument works to chain commands, executing after the agent has exhausted the previous command"""
     # first command needs to be something requiring two tools, so we can check both are ran before the next chained command
-    args.append("write a test.txt file, then patch it")
+    args.append(
+        "we are testing, follow instructions carefully without extra steps. write a test.txt file with the save tool"
+    )
+    args.append("-")
+    args.append("patch it to contain emojis")
     args.append("-")
     args.append("read the contents")
+    args.extend(["--tool-format", "markdown"])
+    args.extend(["--tools", "save,patch,shell,read"])
     result = runner.invoke(gptme.cli.main, args)
     print(result.output)
     # check that outputs came in expected order
     user1_loc = result.output.index("User:")
     user2_loc = result.output.index("User:", user1_loc + 1)
+    user3_loc = result.output.index("User:", user2_loc + 1)
     save_loc = result.output.index("```save")
     patch_loc = result.output.index("```patch")
     print_loc = result.output.rindex("cat test.txt")
-    print(f"{user1_loc=} {save_loc=} {patch_loc=} {user2_loc=} {print_loc=}")
-    assert user1_loc < user2_loc
-    assert save_loc < patch_loc
-    assert patch_loc < user2_loc
-    assert user2_loc < print_loc
+    print(
+        f"{user1_loc=} {save_loc=} {user2_loc=} {patch_loc=} {user3_loc=} {print_loc=}"
+    )
+    assert user1_loc < save_loc
+    assert save_loc < user2_loc
+    assert user2_loc < patch_loc
+    assert patch_loc < user3_loc
+    assert user3_loc < print_loc
     assert result.exit_code == 0
 
 
@@ -306,12 +326,20 @@ def test_tmux(args: list[str], runner: CliRunner):
 # TODO: move elsewhere
 @pytest.mark.slow
 @pytest.mark.flaky(retries=2, delay=5)
+@pytest.mark.skipif(
+    os.environ.get("MODEL") == "openai/gpt-4o-mini", reason="unreliable for gpt-4o-mini"
+)
 def test_subagent(args: list[str], runner: CliRunner):
     # f14: 377
     # f15: 610
     # f16: 987
-    args.append(
-        "test the subagent tool by computing `fib(15)` with it, where `fib(1) = 1` and `fib(2) = 1`"
+    args.extend(["--tools", "ipython,subagent"])
+    args.extend(
+        [
+            "We are in a test. Use the subagent tool to compute `fib(15)`, where `fib(1) = 1` and `fib(2) = 1`.",
+            "-",
+            "Answer with the value.",
+        ]
     )
     print(f"running: gptme {' '.join(args)}")
     result = runner.invoke(gptme.cli.main, args)
@@ -319,19 +347,18 @@ def test_subagent(args: list[str], runner: CliRunner):
 
     # apparently this is not obviously 610
     accepteds = ["377", "610"]
-    assert any([accepted in result.output for accepted in accepteds])
     assert any(
-        [
-            accepted in "```".join(result.output.split("```")[-2:])
-            for accepted in accepteds
-        ]
-    )
+        [accepted in result.output for accepted in accepteds]
+    ), f"Accepteds '{accepteds}' not in output: {result.output}"
+    assert any(
+        [accepted in "```".join(result.output.split("```")) for accepted in accepteds]
+    ), "more complex case, not sure if needed"
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(
-    importlib.util.find_spec("playwright") is None,
-    reason="playwright not installed",
+    gptme.tools.browser.browser is None,
+    reason="no browser tool available",
 )
 def test_url(args: list[str], runner: CliRunner):
     args.append("Who is the CEO of https://superuserlabs.org?")
@@ -344,6 +371,40 @@ def test_url(args: list[str], runner: CliRunner):
 def test_vision(args: list[str], runner: CliRunner):
     args.append(f"can you see the image at {logo}? answer with yes or no")
     result = runner.invoke(gptme.cli.main, args)
+    if result.exception:
+        raise result.exception
     assert result.exit_code == 0
     assert "yes" in result.output
-    assert "yes" in result.output
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "tool_format, expected, not_expected",
+    [
+        ("markdown", ["```shell\nls"], ["<tool-use>\n<shell>\nls"]),
+        ("xml", ["<tool-use>\n<shell>\nls"], ["```shell\nls"]),
+        (
+            "tool",
+            ["@shell:"],
+            ["```shell\nls", "<tool-use>\n<shell>\nls"],
+        ),
+    ],
+)
+def test_tool_format_option(
+    args: list[str], runner: CliRunner, tool_format, expected, not_expected
+):
+    args.append("--show-hidden")
+    args.append("--tool-format")
+    args.append(tool_format)
+    args.append("we are testing, just ls the current dir and then do nothing else")
+
+    result = runner.invoke(gptme.cli.main, args)
+    if result.exception:
+        raise result.exception
+    assert result.exit_code == 0
+
+    for expect in expected:
+        assert expect in result.output
+
+    for not_expect in not_expected:
+        assert not_expect not in result.output

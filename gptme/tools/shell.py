@@ -3,93 +3,104 @@ The assistant can execute shell commands with bash by outputting code blocks wit
 """
 
 import atexit
-import functools
 import logging
 import os
 import re
 import select
-import shutil
 import subprocess
 import sys
 from collections.abc import Generator
+from pathlib import Path
 
 import bashlex
 
 from ..message import Message
-from ..util import get_tokenizer, print_preview
-from .base import ConfirmFunc, ToolSpec, ToolUse
+from ..util import get_installed_programs, get_tokenizer
+from ..util.ask_execute import execute_with_confirmation
+from .base import (
+    ConfirmFunc,
+    Parameter,
+    ToolSpec,
+    ToolUse,
+)
 
 logger = logging.getLogger(__name__)
 
 
-@functools.lru_cache
-def get_installed_programs() -> set[str]:
-    candidates = [
-        # platform-specific
-        "brew",
-        "apt-get",
-        "pacman",
-        # common and useful
-        "ffmpeg",
-        "magick",
-        "pandoc",
-        "git",
-        "docker",
-    ]
-    installed = set()
-    for candidate in candidates:
-        if shutil.which(candidate) is not None:
-            installed.add(candidate)
-    return installed
+allowlist_commands = ["ls", "stat", "cd", "cat", "pwd", "echo", "head"]
+
+candidates = (
+    # platform-specific
+    "brew",
+    "apt-get",
+    "pacman",
+    # common and useful
+    "ffmpeg",
+    "magick",
+    "pandoc",
+    "git",
+    "docker",
+)
 
 
-shell_programs_str = "\n".join(f"- {prog}" for prog in get_installed_programs())
+shell_programs_str = "\n".join(
+    f"- {prog}" for prog in sorted(get_installed_programs(candidates))
+)
 is_macos = sys.platform == "darwin"
 
+
 instructions = f"""
-When you send a message containing bash code, it will be executed in a stateful bash shell.
-The shell will respond with the output of the execution.
-Do not use EOF/HereDoc syntax to send multiline commands, as the assistant will not be able to handle it.
+The given command will be executed in a stateful bash shell.
+The shell tool will respond with the output of the execution.
 
 These programs are available, among others:
 {shell_programs_str}
 """.strip()
 
-examples = f"""
-User: list the current directory
-Assistant: To list the files in the current directory, use `ls`:
-{ToolUse("shell", [], "ls").to_output()}
-System: Ran command: `ls`
+instructions_format: dict[str, str] = {}
+
+
+def examples(tool_format):
+    return f"""
+> User: list the current directory
+> Assistant: To list the files in the current directory, use `ls`:
+{ToolUse("shell", [], "ls").to_output(tool_format)}
+> System: Ran command: `ls`
 {ToolUse("shell", [], '''
 file1.txt
 file2.txt
 '''.strip()).to_output()}
 
 #### The assistant can learn context by exploring the filesystem
-User: learn about the project
-Assistant: Lets start by checking the files
-{ToolUse("shell", [], "git ls-files").to_output()}
-System:
+
+> User: learn about the project
+> Assistant: Lets start by checking the files
+{ToolUse("shell", [], "git ls-files").to_output(tool_format)}
+> System:
 {ToolUse("stdout", [], '''
 README.md
 main.py
 '''.strip()).to_output()}
-Assistant: Now lets check the README
-{ToolUse("shell", [], "cat README.md").to_output()}
-System:
+> Assistant: Now lets check the README
+{ToolUse("shell", [], "cat README.md").to_output(tool_format)}
+> System:
 {ToolUse("stdout", [], "(contents of README.md)").to_output()}
-Assistant: Now we check main.py
-{ToolUse("shell", [], "cat main.py").to_output()}
-System:
+> Assistant: Now we check main.py
+{ToolUse("shell", [], "cat main.py").to_output(tool_format)}
+> System:
 {ToolUse("stdout", [], "(contents of main.py)").to_output()}
-Assistant: The project is...
+> Assistant: The project is...
 
 
 #### Create vue project
-User: Create a new vue project with typescript and pinia named fancy-project
-Assistant: Sure! Let's create a new vue project with TypeScript and Pinia named fancy-project:
-{ToolUse("shell", [], "npm init vue@latest fancy-project --yes -- --typescript --pinia").to_output()}
-System:
+
+> User: Create a new vue project with typescript and pinia named fancy-project
+> Assistant: Sure! Let's create a new vue project with TypeScript and Pinia named fancy-project:
+{ToolUse("shell",
+    [],
+    "npm init vue@latest fancy-project --yes -- --typescript --pinia"
+).to_output()}
+> System:
 {ToolUse("stdout", [], '''
 > npx
 > create-vue
@@ -98,7 +109,7 @@ Vue.js - The Progressive JavaScript Framework
 
 Scaffolding project in ./fancy-project...
 '''.strip()).to_output()}
-"""
+""".strip()
 
 
 class ShellSession:
@@ -127,6 +138,8 @@ class ShellSession:
         self.delimiter = "END_OF_COMMAND_OUTPUT"
 
         # set GIT_PAGER=cat
+        self.run("export PAGER=")
+        self.run("export GH_PAGER=")
         self.run("export GIT_PAGER=cat")
 
     def run(self, code: str, output=True) -> tuple[int | None, str, str]:
@@ -147,7 +160,8 @@ class ShellSession:
         assert self.process.stdin
 
         # run the command
-        full_command = f"{command}; echo ReturnCode:$? {self.delimiter}\n"
+        full_command = f"{command}\n"
+        full_command += f"echo ReturnCode:$? {self.delimiter}\n"
         try:
             self.process.stdin.write(full_command)
         except BrokenPipeError:
@@ -162,10 +176,9 @@ class ShellSession:
 
         self.process.stdin.flush()
 
-        stdout = []
-        stderr = []
-        return_code = None
-        read_delimiter = False
+        stdout: list[str] = []
+        stderr: list[str] = []
+        return_code: int | None = None
 
         while True:
             rlist, _, _ = select.select([self.stdout_fd, self.stderr_fd], [], [])
@@ -175,15 +188,22 @@ class ShellSession:
                 # 2**12 = 4096
                 # 2**16 = 65536
                 data = os.read(fd, 2**16).decode("utf-8")
-                for line in re.split(r"(\n)", data):
-                    if "ReturnCode:" in line:
-                        return_code_str = (
-                            line.split("ReturnCode:")[1].split(" ")[0].strip()
+                lines = data.splitlines(keepends=True)
+                re_returncode = re.compile(r"ReturnCode:(\d+)")
+                for line in lines:
+                    if "ReturnCode:" in line and self.delimiter in line:
+                        if match := re_returncode.search(line):
+                            return_code = int(match.group(1))
+                        # if command is cd and successful, we need to change the directory
+                        if command.startswith("cd ") and return_code == 0:
+                            ex, pwd, _ = self._run("pwd", output=False)
+                            assert ex == 0
+                            os.chdir(pwd.strip())
+                        return (
+                            return_code,
+                            "".join(stdout).strip(),
+                            "".join(stderr).strip(),
                         )
-                        return_code = int(return_code_str)
-                    if self.delimiter in line:
-                        read_delimiter = True
-                        continue
                     if fd == self.stdout_fd:
                         stdout.append(line)
                         if output:
@@ -192,20 +212,6 @@ class ShellSession:
                         stderr.append(line)
                         if output:
                             print(line, end="", file=sys.stderr)
-            if read_delimiter:
-                break
-
-        # if command is cd and successful, we need to change the directory
-        if command.startswith("cd ") and return_code == 0:
-            ex, pwd, _ = self._run("pwd", output=False)
-            assert ex == 0
-            os.chdir(pwd.strip())
-
-        return (
-            return_code,
-            "".join(stdout).replace(f"ReturnCode:{return_code}", "").strip(),
-            "".join(stderr).strip(),
-        )
 
     def close(self):
         assert self.process.stdin
@@ -240,36 +246,47 @@ def set_shell(shell: ShellSession) -> None:
 cmd_regex = re.compile(r"(?:^|[|&;]|\|\||&&|\n)\s*([^\s|&;]+)")
 
 
-def execute_shell(
-    code: str, args: list[str], confirm: ConfirmFunc
-) -> Generator[Message, None, None]:
-    """Executes a shell command and returns the output."""
-    shell = get_shell()
-    assert not args
-    allowlist_commands = ["ls", "stat", "cd", "cat", "pwd", "echo", "head"]
-    allowlisted = True
+def get_shell_command(
+    code: str | None, args: list[str] | None, kwargs: dict[str, str] | None
+) -> str:
+    """Get the shell command from code/args/kwargs."""
+    if code is not None and args is not None:
+        assert not args
+        cmd = code.strip()
+        if cmd.startswith("$ "):
+            cmd = cmd[len("$ ") :]
+    elif kwargs is not None:
+        cmd = kwargs.get("command", "")
+    else:
+        raise ValueError("No command provided")
+    return cmd
 
-    cmd = code.strip()
-    if cmd.startswith("$ "):
-        cmd = cmd[len("$ ") :]
 
+def preview_shell(cmd: str, _: Path | None) -> str:
+    """Prepare preview for shell command."""
+    return cmd
+
+
+def is_allowlisted(cmd: str) -> bool:
     for match in cmd_regex.finditer(cmd):
         for group in match.groups():
             if group and group not in allowlist_commands:
-                allowlisted = False
-                break
+                return False
+    return True
 
-    if not allowlisted:
-        print_preview(cmd, "bash")
-        if not confirm("Run command?"):
-            yield Message("system", "User chose not to run command.")
-            return
+
+def execute_shell_impl(
+    cmd: str, _: Path | None, confirm: ConfirmFunc
+) -> Generator[Message, None, None]:
+    """Execute shell command and format output."""
+    shell = get_shell()
+    allowlisted = is_allowlisted(cmd)
 
     try:
         returncode, stdout, stderr = shell.run(cmd)
     except Exception as e:
-        yield Message("system", f"Error: {e}")
-        return
+        raise ValueError(f"Shell error: {e}") from None
+
     stdout = _shorten_stdout(stdout.strip(), pre_tokens=2000, post_tokens=8000)
     stderr = _shorten_stdout(stderr.strip(), pre_tokens=2000, post_tokens=2000)
 
@@ -289,6 +306,37 @@ def execute_shell(
         msg += f"Return code: {returncode}"
 
     yield Message("system", msg)
+
+
+def get_path_fn(*args, **kwargs) -> Path | None:
+    return None
+
+
+def execute_shell(
+    code: str | None,
+    args: list[str] | None,
+    kwargs: dict[str, str] | None,
+    confirm: ConfirmFunc,
+) -> Generator[Message, None, None]:
+    """Executes a shell command and returns the output."""
+    cmd = get_shell_command(code, args, kwargs)
+
+    # Skip confirmation for allowlisted commands
+    if is_allowlisted(cmd):
+        yield from execute_shell_impl(cmd, None, lambda _: True)
+    else:
+        yield from execute_with_confirmation(
+            cmd,
+            args,
+            kwargs,
+            confirm,
+            execute_fn=execute_shell_impl,
+            get_path_fn=get_path_fn,
+            preview_fn=preview_shell,
+            preview_lang="bash",
+            confirm_msg="Run command?",
+            allow_edit=True,
+        )
 
 
 def _format_block_smart(header: str, cmd: str, lang="") -> str:
@@ -395,8 +443,17 @@ tool = ToolSpec(
     name="shell",
     desc="Executes shell commands.",
     instructions=instructions,
+    instructions_format=instructions_format,
     examples=examples,
     execute=execute_shell,
     block_types=["shell"],
+    parameters=[
+        Parameter(
+            name="command",
+            type="string",
+            description="The shell command with arguments to execute.",
+            required=True,
+        ),
+    ],
 )
 __doc__ = tool.get_doc(__doc__)

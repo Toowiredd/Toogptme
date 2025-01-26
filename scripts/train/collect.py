@@ -11,9 +11,9 @@ import logging
 from pathlib import Path
 
 import click
-import torch
-from gptme.util import is_generated_name
-from transformers import pipeline
+import torch  # type: ignore
+from gptme.util.generate_name import is_generated_name
+from transformers import pipeline  # type: ignore
 
 logger = logging.getLogger(__name__)
 

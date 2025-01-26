@@ -8,7 +8,7 @@ SRCDIRS = gptme tests scripts
 SRCFILES = $(shell find ${SRCDIRS} -name '*.py')
 
 # exclude files
-EXCLUDES = tests/output scripts/build_changelog.py
+EXCLUDES = tests/output scripts/build_changelog.py scripts/tts_server.py
 SRCFILES = $(shell find ${SRCDIRS} -name '*.py' $(foreach EXCLUDE,$(EXCLUDES),-not -path $(EXCLUDE)))
 
 build:
@@ -43,7 +43,7 @@ eval:
 	poetry run gptme-eval
 
 typecheck:
-	poetry run mypy --ignore-missing-imports --check-untyped-defs ${SRCDIRS} $(if $(EXCLUDES),$(foreach EXCLUDE,$(EXCLUDES),--exclude $(EXCLUDE)))
+	poetry run mypy ${SRCDIRS} $(if $(EXCLUDES),$(foreach EXCLUDE,$(EXCLUDES),--exclude $(EXCLUDE)))
 
 RUFF_ARGS=${SRCDIRS} $(foreach EXCLUDE,$(EXCLUDES),--exclude $(EXCLUDE))
 
@@ -52,7 +52,8 @@ lint:
 	! grep -r 'ToolUse("python"' ${SRCDIRS}
 	@# ruff
 	poetry run ruff check ${RUFF_ARGS}
-
+	@# pylint (always pass, just output duplicates)
+	poetry run pylint --disable=all --enable=duplicate-code --exit-zero gptme/
 
 format:
 	poetry run ruff check --fix-only ${RUFF_ARGS}
@@ -135,8 +136,13 @@ clean-test:
 
 cloc: cloc-core cloc-tools cloc-server cloc-tests
 
+FILES_LLM=gptme/llm/*.py
+FILES_CORE=gptme/*.py $(FILES_LLM) gptme/util/*.py gptme/tools/__init__.py gptme/tools/base.py
 cloc-core:
-	cloc gptme/*.py gptme/tools/__init__.py gptme/tools/base.py --by-file
+	cloc $(FILES_CORE) --by-file
+
+cloc-llm:
+	cloc $(FILES_LLM) --by-file
 
 cloc-tools:
 	cloc gptme/tools/*.py --by-file
@@ -145,7 +151,7 @@ cloc-server:
 	cloc gptme/server --by-file
 
 cloc-tests:
-	cloc tests/*.py --by-file
+	cloc tests --by-file
 
 cloc-eval:
 	cloc gptme/eval/**.py --by-file
@@ -154,4 +160,6 @@ cloc-total:
 	cloc ${SRCFILES} --by-file
 
 bench-importtime:
-	time poetry run python -X importtime -m gptme --model openrouter --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
+	time poetry run python -X importtime -m gptme --model openai --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
+	@#time poetry run python -X importtime -m gptme --model openrouter --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
+	@#time poetry run python -X importtime -m gptme --model anthropic --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
