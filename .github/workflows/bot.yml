@@ -1,8 +1,12 @@
+# DISABLED AUTO-RUN: Originally triggered on auto-triggers
+# Converted to manual execution only - 2025-10-18
+# Backup available at: bot.yml.backup
 name: gptme-bot
 
 on:
-  issue_comment:
-    types: [created]
+  workflow_dispatch:  # Manual trigger only
+#   issue_comment:
+#     types: [created]
 
 permissions: write-all
 

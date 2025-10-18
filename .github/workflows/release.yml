@@ -1,8 +1,12 @@
+# DISABLED AUTO-RUN: Originally triggered on auto-triggers
+# Converted to manual execution only - 2025-10-18
+# Backup available at: release.yml.backup
 name: Release
 
 on:
-  release:
-    types: [created]
+  workflow_dispatch:  # Manual trigger only
+#   release:
+#     types: [created]
 
 jobs:
   publish-pypi:

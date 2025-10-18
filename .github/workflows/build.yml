@@ -1,12 +1,16 @@
+# DISABLED AUTO-RUN: Originally triggered on auto-triggers
+# Converted to manual execution only - 2025-10-18
+# Backup available at: build.yml.backup
 name: Build
 
 on:
-  push:
-    branches: [ master ]
-    tags:
-      - 'v*'
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:  # Manual trigger only
+#   push:
+#     branches: [ master ]
+#     tags:
+#       - 'v*'
+#   pull_request:
+#     branches: [ master ]
 
 env:
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

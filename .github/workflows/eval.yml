@@ -1,26 +1,30 @@
+# DISABLED AUTO-RUN: Originally triggered on auto-triggers
+# Converted to manual execution only - 2025-10-18
+# Backup available at: eval.yml.backup
 name: Evals
 
 on:
-  schedule:
-    - cron: '0 2 * * *'  # Run daily at 2 AM UTC
-  workflow_dispatch:
-    inputs:
-      suite:
-        description: 'Eval suite to run (leave empty for basic suite)'
-        required: false
-      models:
-        description: 'Comma-separated list of models to evaluate'
-        required: false
-      timeout:
-        description: 'Timeout for each eval in seconds'
-        type: number
-        required: false
-      image-suffix:
-        type: choice
-        description: 'Suffix to use for docker image'
-        options:
-        - ''
-        - '-full'
+  workflow_dispatch:  # Manual trigger only
+#   schedule:
+#     - cron: '0 2 * * *'  # Run daily at 2 AM UTC
+#   workflow_dispatch:
+#     inputs:
+#       suite:
+#         description: 'Eval suite to run (leave empty for basic suite)'
+#         required: false
+#       models:
+#         description: 'Comma-separated list of models to evaluate'
+#         required: false
+#       timeout:
+#         description: 'Timeout for each eval in seconds'
+#         type: number
+#         required: false
+#       image-suffix:
+#         type: choice
+#         description: 'Suffix to use for docker image'
+#         options:
+#         - ''
+#         - '-full'
 
 jobs:
   run-evals:
